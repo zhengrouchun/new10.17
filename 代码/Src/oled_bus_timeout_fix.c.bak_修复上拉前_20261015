@@ -1,0 +1,252 @@
+#include "main.h" /* 引入GPIO、时钟和毫秒计数接口。 */
+#include "oled_bus_timeout_fix.h" /* 引入本文件公开接口。 */
+
+#define OLED_SCL_PIN GPIO_PIN_6 /* PB6连接OLED第3脚SCL。 */
+#define OLED_SDA_PIN GPIO_PIN_7 /* PB7连接OLED第4脚SDA。 */
+#define OLED_BUS_PINS (OLED_SCL_PIN | OLED_SDA_PIN) /* 同时选择两根总线引脚。 */
+#define OLED_EDGE_DELAY_LOOPS 200 /* 8MHz下约25微秒，留足Proteus仿真模型建立/保持时间，避免spurious transition。 */
+#define OLED_CLOCK_WAIT_MS 3 /* SCL释放后最多等待3毫秒，防止外部拉低导致死循环。 */
+#define OLED_TRANSACTION_LIMIT_MS 1000 /* 每笔交易最多1秒；显示层每包只发16个像素字节，不能再假定整页能在1秒内完成。 */
+#define OLED_RECOVERY_CLOCKS 9 /* SDA卡低时最多补九个时钟帮助从机退出残留字节。 */
+#define OLED_BYTE_BITS 8 /* 每个I2C数据字节包含八位。 */
+#define OLED_TOP_BIT 0x80 /* I2C先发送字节的最高位。 */
+
+static const char *bus_error = "NOT_PROBED"; /* 保存最近交易的真实结果。 */
+static const char *bus_stage = "IDLE"; /* 保存失败位置，成功后为DONE。 */
+static uint32_t transaction_started_ms; /* 记录本次交易开始时间。 */
+
+static void EdgeDelay(void) /* 保证数据建立时间、SCL高低宽度及上拉稳定时间。 */
+{
+    volatile int remaining; /* 防止编译器删除延时循环。 */
+    for (remaining = OLED_EDGE_DELAY_LOOPS; remaining > 0; --remaining) /* 执行有界短延时，中断始终可以进入。 */
+    {
+        __NOP(); /* 至少消耗一个CPU周期。 */
+    }
+}
+
+static void ReleaseLine(uint16_t pin) /* 开漏输出写1释放导线，电平由4.7k上拉和从机决定。 */
+{
+    HAL_GPIO_WritePin(GPIOB, pin, GPIO_PIN_SET); /* 关闭开漏下拉管，不主动输出高电平。 */
+}
+
+static void PullLow(uint16_t pin) /* 只主动拉低总线，避免与从机输出发生高低电平冲突。 */
+{
+    HAL_GPIO_WritePin(GPIOB, pin, GPIO_PIN_RESET); /* 开启开漏下拉管，产生总线低电平。 */
+}
+
+static void SetSdaInput(int receive_ack) /* ACK时显式使用输入通道，避开仿真器输出模式回读的差异。 */
+{
+    GPIO_InitTypeDef gpio = {0}; /* 清空临时配置，避免使用未初始化字段。 */
+    gpio.Pin = OLED_SDA_PIN; /* 只切换PB7，不改变正在拉低的PB6时钟。 */
+    gpio.Mode = receive_ack ? GPIO_MODE_INPUT : GPIO_MODE_OUTPUT_OD; /* 接收应答用输入，发送数据用开漏输出。 */
+    gpio.Pull = GPIO_NOPULL; /* 由外部4.7k电阻提供上拉。 */
+    gpio.Speed = GPIO_SPEED_FREQ_LOW; /* 软件总线无需高速GPIO边沿。 */
+    HAL_GPIO_Init(GPIOB, &gpio); /* 仅在SCL低电平期间切换方向。 */
+}
+
+static int ClockHigh(void) /* 释放SCL并确认实际输入变高，支持有限的时钟延展。 */
+{
+    uint32_t started_ms = HAL_GetTick(); /* 记录本次等待开始时间。 */
+    ReleaseLine(OLED_SCL_PIN); /* 允许外部上拉拉高SCL。 */
+    EdgeDelay(); /* 给RC上升沿和仿真事件传播留时间。 */
+    while (HAL_GPIO_ReadPin(GPIOB, OLED_SCL_PIN) == GPIO_PIN_RESET) /* 实际读到高电平后才允许继续。 */
+    {
+        if (HAL_GetTick() - started_ms >= OLED_CLOCK_WAIT_MS) /* 等待到期时结束本次通信。 */
+        {
+            bus_error = "SCL_HELD_LOW"; /* 明确指出时钟线无法释放。 */
+            return 0; /* 向调用者报告失败。 */
+        }
+    }
+    EdgeDelay(); /* 保证确认后的SCL高电平保持时间。 */
+    return 1; /* 时钟已真实变高。 */
+}
+
+static int StopTransfer(void) /* 产生SCL为高时SDA由低变高的STOP。 */
+{
+    PullLow(OLED_SCL_PIN); /* 先拉低时钟，避免SDA变化被误识别成START。 */
+    EdgeDelay(); /* 等待SCL确实进入低电平，再改变SDA，避免仿真器记录多余的START。 */
+    PullLow(OLED_SDA_PIN); /* 为STOP准备低电平数据线。 */
+    EdgeDelay(); /* 保证停止前的低电平建立时间。 */
+    if (!ClockHigh()) /* SCL被外部拉低时不能形成有效STOP。 */
+    {
+        ReleaseLine(OLED_BUS_PINS); /* 即使失败也撤销本机对两根线的驱动。 */
+        return 0; /* 由上层保留错误。 */
+    }
+    ReleaseLine(OLED_SDA_PIN); /* 在SCL高时释放SDA，产生停止条件。 */
+    EdgeDelay(); /* 等待总线恢复空闲。 */
+    if (HAL_GPIO_ReadPin(GPIOB, OLED_SDA_PIN) == GPIO_PIN_RESET) /* 检查停止后是否仍被外部拉低。 */
+    {
+        bus_error = "SDA_HELD_LOW"; /* 输出具体线路错误。 */
+        return 0; /* STOP没有成功完成。 */
+    }
+    return 1; /* 两线空闲，STOP成功。 */
+}
+
+void OledBus_Init(void) /* 接管显示引脚并避开硬件I2C的SWRST和BUSY路径。 */
+{
+    GPIO_InitTypeDef gpio = {0}; /* 初始化GPIO配置结构体。 */
+    __HAL_RCC_GPIOB_CLK_ENABLE(); /* 开启PB6和PB7所在端口的时钟。 */
+    __HAL_RCC_I2C1_CLK_ENABLE(); /* 临时开启I2C1时钟，允许访问控制寄存器。 */
+    CLEAR_BIT(I2C1->CR1, I2C_CR1_PE); /* 关闭硬件I2C，避免外设占用软件总线引脚。 */
+    __HAL_RCC_I2C1_CLK_DISABLE(); /* 软件实现不使用I2C1外设时钟。 */
+    ReleaseLine(OLED_BUS_PINS); /* 先预置输出锁存为释放状态，避免初始化产生低脉冲。 */
+    gpio.Pin = OLED_BUS_PINS; /* 同时配置PB6和PB7。 */
+    gpio.Mode = GPIO_MODE_OUTPUT_OD; /* 发送数据时使用普通开漏输出。 */
+    gpio.Pull = GPIO_NOPULL; /* 与CubeMX一致，不使用内部上拉。 */
+    gpio.Speed = GPIO_SPEED_FREQ_LOW; /* 与CubeMX一致，使用低速GPIO。 */
+    HAL_GPIO_Init(GPIOB, &gpio); /* 应用软件I2C引脚配置。 */
+    EdgeDelay(); /* 等待外部电阻将两根线拉高。 */
+}
+
+static void CaptureLevels(char *pair) /* 按SCL在前、SDA在后的顺序记录一对电平。 */
+{
+    EdgeDelay(); /* 等待上一操作传播到输入。 */
+    pair[0] = HAL_GPIO_ReadPin(GPIOB, OLED_SCL_PIN) == GPIO_PIN_SET ? 'H' : 'L'; /* 保存时钟读数。 */
+    pair[1] = HAL_GPIO_ReadPin(GPIOB, OLED_SDA_PIN) == GPIO_PIN_SET ? 'H' : 'L'; /* 保存数据读数。 */
+}
+
+const char *OledBus_Diagnose(void) /* 启动时执行一次独立线测试，不用这些读数伪造设备ACK。 */
+{
+    static char levels[] = "--/--/--/--"; /* 四组依次是释放、拉低SCL、拉低SDA、恢复；避免C三字符组改变字符串长度。 */
+    ReleaseLine(OLED_BUS_PINS); /* 第一步释放两个开漏输出。 */
+    CaptureLevels(&levels[0]); /* 正常应为HH。 */
+    PullLow(OLED_SCL_PIN); /* 第二步只拉低时钟。 */
+    CaptureLevels(&levels[3]); /* 正常应为LH，SDA随之变低则怀疑短接或外部占线。 */
+    ReleaseLine(OLED_SCL_PIN); /* 先让时钟恢复高电平。 */
+    EdgeDelay(); /* 等待SCL上升完成。 */
+    PullLow(OLED_SDA_PIN); /* 第三步只拉低数据，相当于一次START。 */
+    CaptureLevels(&levels[6]); /* 正常应为HL，SCL随之变低需检查跨线连接。 */
+    StopTransfer(); /* 用标准STOP结束诊断，避免从机停留在START之后。 */
+    ReleaseLine(OLED_BUS_PINS); /* 两根开漏输出恢复释放状态，下一步是真实总线通信。 */
+    CaptureLevels(&levels[9]); /* 正常应为HH。 */
+    return levels; /* 返回静态字符串供串口打印。 */
+}
+
+static int StartTransfer(void) /* 确认空闲、必要时恢复总线，然后产生START。 */
+{
+    int pulse; /* 记录恢复时钟数量。 */
+    ReleaseLine(OLED_SDA_PIN); /* 确保主机不把数据线拉低。 */
+    if (!ClockHigh()) /* 无法拉高SCL时没有条件发送START。 */
+    {
+        return 0; /* 保留SCL_HELD_LOW错误。 */
+    }
+    for (pulse = 0; pulse < OLED_RECOVERY_CLOCKS && HAL_GPIO_ReadPin(GPIOB, OLED_SDA_PIN) == GPIO_PIN_RESET; ++pulse) /* 只在数据线卡低时执行有限恢复。 */
+    {
+        PullLow(OLED_SCL_PIN); /* 产生恢复时钟的低电平。 */
+        EdgeDelay(); /* 留足低电平宽度。 */
+        if (!ClockHigh()) /* 产生恢复时钟高电平并检查线路。 */
+        {
+            return 0; /* 恢复过程发现SCL卡低时立即结束。 */
+        }
+    }
+    if (pulse > 0 && !StopTransfer()) /* 只有恢复过卡低的SDA才补发STOP；正常空闲时直接产生START。 */
+    {
+        return 0; /* 总线恢复后仍无法释放时，不尝试发送地址。 */
+    }
+    EdgeDelay(); /* 留出总线空闲建立时间。 */
+    PullLow(OLED_SDA_PIN); /* 在SCL为高时拉低SDA，产生START。 */
+    EdgeDelay(); /* 保证START保持时间。 */
+    PullLow(OLED_SCL_PIN); /* 开始第一个数据位的低电平阶段。 */
+    EdgeDelay();
+    return 1; /* START已完成。 */
+}
+
+static int WriteByte(uint8_t value) /* 发送八位并在第九个时钟检查从机ACK。 */
+{
+    int bit; /* 记录已经发送的位数。 */
+    int acknowledged; /* 保存从机是否确实拉低ACK。 */
+    for (bit = 0; bit < OLED_BYTE_BITS; ++bit) /* 依次发送最高位到最低位。 */
+    {
+        if (HAL_GetTick() - transaction_started_ms >= OLED_TRANSACTION_LIMIT_MS) /* 限制整笔交易总耗时。 */
+        {
+            bus_error = "TRANSFER_TIMEOUT"; /* 区分总时限与单次SCL卡低。 */
+            return 0; /* 放弃本次发送，由上层释放总线。 */
+        }
+        if ((value & OLED_TOP_BIT) != 0) /* 数据位为1时释放SDA。 */
+        {
+            ReleaseLine(OLED_SDA_PIN); /* 电阻负责拉高，主机不强推高电平。 */
+        }
+        else /* 数据位为0时主动拉低。 */
+        {
+            PullLow(OLED_SDA_PIN); /* 用开漏输出发送零位。 */
+        }
+        EdgeDelay(); /* SCL升高之前建立数据。 */
+        if (!ClockHigh()) /* 让从机在有效高电平期间采样。 */
+        {
+            return 0; /* 时钟失败立即停止发送。 */
+        }
+        PullLow(OLED_SCL_PIN); /* 结束当前数据位的高电平。 */
+        EdgeDelay(); /* 保证数据保持时间及下一位低电平宽度。 */
+        value = (uint8_t)(value << 1); /* 将下一数据位移到最高位位置。 */
+    }
+    ReleaseLine(OLED_SDA_PIN); /* ACK期间必须释放数据线，避免主机把零误当成从机应答。 */
+    SetSdaInput(1); /* SCL仍为低时切换PB7为高阻输入，准备读取第九位。 */
+    EdgeDelay(); /* 给从机建立ACK留时间。 */
+    if (!ClockHigh()) /* 产生第九个时钟。 */
+    {
+        PullLow(OLED_SCL_PIN); /* 先确保时钟为低再恢复SDA方向。 */
+        SetSdaInput(0); /* 恢复开漏发送模式，让后续STOP可以正常拉低SDA。 */
+        return 0; /* 无有效ACK时钟就不能宣称成功。 */
+    }
+    acknowledged = HAL_GPIO_ReadPin(GPIOB, OLED_SDA_PIN) == GPIO_PIN_RESET; /* 在输入模式下读取真正的应答电平。 */
+    PullLow(OLED_SCL_PIN); /* ACK采样后结束第九个时钟。 */
+    EdgeDelay(); /* 允许从机释放ACK。 */
+    SetSdaInput(0); /* SDA锁存仍为1，恢复开漏不会强拉低或强推高。 */
+    if (!acknowledged) /* 高电平表示NACK。 */
+    {
+        bus_error = "NACK"; /* 阶段字段会进一步说明地址还是数据未应答。 */
+    }
+    return acknowledged; /* 不跳过ACK，不用延时冒充通信成功。 */
+}
+
+int OledBus_Write(uint8_t address, const uint8_t *data, uint16_t count) /* 为OLED执行一次完整、有限时的写交易。 */
+{
+    uint16_t index; /* 逐字节处理命令或像素数据。 */
+    int success; /* 保存地址和数据传输状态。 */
+    int transfer_succeeded; /* 记录STOP清理之前的传输结果。 */
+    const char *failed_error; /* 清理总线时保留第一处错误。 */
+    const char *failed_stage; /* 清理总线时保留第一处失败位置。 */
+    bus_error = "OK"; /* 开始新交易，清除上一笔错误。 */
+    bus_stage = "BUS_IDLE"; /* 第一阶段确认线路空闲。 */
+    transaction_started_ms = HAL_GetTick(); /* 为整个交易计时。 */
+    success = StartTransfer(); /* 检查线路并发送START。 */
+    if (success) /* 只有START成功才发送地址。 */
+    {
+        bus_stage = "ADDRESS"; /* 后续NACK可定位到地址阶段。 */
+        success = WriteByte((uint8_t)(address << 1)); /* 七位地址左移一位，最低位零表示写操作。 */
+    }
+    for (index = 0; success && index < count; ++index) /* 任一字节失败后不再继续发送。 */
+    {
+        bus_stage = index == 0 ? "CONTROL" : "PAYLOAD"; /* 区分SSD1306控制字和命令或像素数据。 */
+        success = WriteByte(data[index]); /* 每个字节均要求真实ACK。 */
+    }
+    failed_error = bus_error; /* 暂存最先失败原因。 */
+    failed_stage = bus_stage; /* 暂存最先失败阶段。 */
+    transfer_succeeded = success; /* 避免清理步骤覆盖最初失败的判断。 */
+    bus_stage = "STOP"; /* 尝试结束传输并释放线路。 */
+    if (!StopTransfer()) /* STOP失败同样不能报告成功。 */
+    {
+        success = 0; /* 将停止错误计入交易结果。 */
+    }
+    if (!transfer_succeeded) /* 之前已有传输错误时保留第一处失败。 */
+    {
+        bus_error = failed_error; /* 恢复第一处错误。 */
+        bus_stage = failed_stage; /* 恢复第一处阶段。 */
+    }
+    if (success) /* 地址、全部数据和STOP都成功才进入完成状态。 */
+    {
+        bus_stage = "DONE"; /* 供终端确认完整交易已完成。 */
+    }
+    ReleaseLine(OLED_BUS_PINS); /* 所有返回路径都撤销主机驱动，方便测电压和重连。 */
+    return success; /* 返回真实交易结果。 */
+}
+
+const char *OledBus_Error(void) /* 公开最近一笔交易的错误名称。 */
+{
+    return bus_error; /* 返回稳定的常量字符串。 */
+}
+
+const char *OledBus_Stage(void) /* 公开最近一笔交易的阶段名称。 */
+{
+    return bus_stage; /* 返回失败位置或DONE。 */
+}

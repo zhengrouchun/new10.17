@@ -1,0 +1,19 @@
+R18 CubeMX ADC1 setting (for deterministic explicit channel reads)
+
+PA0: ADC1_IN0 / analog, physical node DIV_VB
+PA1: analog input, physical node DIV_VA (runtime code selects ADC_CHANNEL_1)
+
+ADC1:
+- Scan Conversion Mode: DISABLE
+- Continuous Conversion Mode: DISABLE
+- Discontinuous Conversion Mode: DISABLE
+- Number Of Conversion: 1
+- External Trigger: Software Start
+- Data Alignment: Right
+- Rank 1 default: ADC_CHANNEL_0
+- Sampling Time: 239.5 cycles
+
+Important:
+1. First verify R18 by replacing the supplied source files and rebuilding in Keil.
+2. Do NOT press CubeMX Generate Code before the above ADC settings are made, otherwise adc.c can be overwritten back to scan/discontinuous mode.
+3. RETEST PA4 remains GPIO_EXTI4 + Pull-up; STOP PA5 remains EXTI falling + Pull-up.

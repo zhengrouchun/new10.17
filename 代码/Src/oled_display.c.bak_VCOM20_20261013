@@ -1,0 +1,271 @@
+#include "main.h" /* 获取STM32 HAL和I2C类型。 */
+#include "oled_display.h" /* 引入显示接口和屏幕尺寸。 */
+#include "oled_bus_timeout_fix.h" /* 选择GPIO兼容总线并取得具体通信错误。 */
+#include <string.h> /* 用于清空字符缓冲和查找字形。 */
+
+/* 临时诊断开关：0=正常文字显示，1=A5强制全屏点亮，2=向全部显存写入FF。
+ * 不要长期保留1/2；确认实验后改回0，再编译HEX。 */
+#define OLED_DIAGNOSTIC_MODE 0
+#if OLED_DIAGNOSTIC_MODE < 0 || OLED_DIAGNOSTIC_MODE > 2
+#error OLED_DIAGNOSTIC_MODE must be 0, 1 or 2
+#endif
+
+#if !OLED_USE_SOFTWARE_I2C
+extern I2C_HandleTypeDef hi2c1;
+#endif /* 使用主程序初始化的PB6/PB7硬件I2C1。 */
+enum /* 为控制字节和SSD1306命令赋予可读名称，数值来自控制器数据手册。 */
+{
+    OLED_CONTROL_COMMAND = 0x00, /* 后续字节按照命令解释。 */
+    OLED_CONTROL_DATA = 0x40, /* 后续字节写入显示存储器。 */
+    OLED_DISPLAY_OFF = 0xAE, /* 在配置和清屏期间关闭画面。 */
+    OLED_DISPLAY_ON = 0xAF, /* 完成配置后开启画面。 */
+    OLED_CLOCK = 0xD5, /* 设置显示时钟分频。 */
+    OLED_CLOCK_DEFAULT = 0x80, /* 使用默认振荡频率和一分频。 */
+    OLED_MULTIPLEX = 0xA8, /* 设置扫描行数减一。 */
+    OLED_LAST_ROW = 63, /* 128乘64屏幕共扫描64行。 */
+    OLED_OFFSET = 0xD3, /* 设置显示垂直偏移。 */
+    OLED_ZERO_OFFSET = 0, /* 从第一行和第一列开始显示。 */
+    OLED_START_LINE = 0x40, /* 把显示起始行设为零。 */
+    OLED_CHARGE_PUMP = 0x8D, /* 配置SSD1306内部升压电荷泵。 */
+    OLED_PUMP_ENABLE = 0x14, /* 开启模块常用的内部电荷泵模式。 */
+    OLED_ADDRESS_MODE = 0x20, /* 选择显示内存寻址模式。 */
+    OLED_PAGE_MODE = 0x02, /* 本驱动每次显式定位一页。 */
+    OLED_SEGMENT_REMAP = 0xA1, /* 反向映射列，匹配常见模块方向。 */
+    OLED_COM_REVERSE = 0xC8, /* 反向扫描COM，匹配常见模块方向。 */
+    OLED_COM_PINS = 0xDA, /* 配置COM引脚排列。 */
+    OLED_COM_64_ROWS = 0x12, /* 使用128乘64模块常见COM配置。 */
+    OLED_CONTRAST = 0x81, /* 设置亮度对比度。 */
+    OLED_CONTRAST_NORMAL = 0x7F, /* 使用中等亮度。 */
+    OLED_PRECHARGE = 0xD9, /* 设置像素预充电时间。 */
+    OLED_PRECHARGE_INTERNAL = 0xF1, /* 设置内部电荷泵应用的预充电参数。 */
+    OLED_VCOM = 0xDB, /* 设置公共电极取消选择电平。 */
+    OLED_VCOM_NORMAL = 0x20, /* SSD1306数据手册支持的VCOMH值，代替原先保留值0x40。 */
+    OLED_USE_RAM = 0xA4, /* 显示RAM中的像素，而非强制全亮。 */
+    OLED_NORMAL_PIXELS = 0xA6, /* 采用正常黑底亮字模式。 */
+    OLED_SCROLL_OFF = 0x2E, /* 禁止硬件滚动，保持文字稳定。 */
+    OLED_PAGE_BASE = 0xB0, /* 加页号即可选择第0至第7页。 */
+    OLED_COLUMN_LOW = 0x00, /* 列地址低四位设为零。 */
+    OLED_COLUMN_HIGH = 0x10, /* 列地址高四位设为零。 */
+    OLED_WIDTH = 128, /* 每页128个像素列。 */
+    OLED_DATA_CHUNK_BYTES = 16, /* 慢速仿真每笔只发16个像素字节，避免整页超过单笔1秒上限。 */
+    OLED_GLYPH_WIDTH = 5, /* 字形本体占5列。 */
+    OLED_CHARACTER_WIDTH = 6, /* 每个字符额外保留1列间隔。 */
+    OLED_TIMEOUT_MS = 25, /* 单次I2C传输最长等待25ms，停止中断仍可响应。 */
+    OLED_PROBE_TIMEOUT_MS = 3 /* 每次地址探测只等待3ms。 */
+};
+static uint8_t address_7bit; /* 保存响应的七位地址，不混用0x78格式的总线字节。 */
+static int online; /* 记录屏幕最近一次传输是否成功。 */
+static void (*progress_callback)(int completed_pages); /* 可选页完成通知；未注册时为空，不影响独立使用。 */
+static const char *probe_error[2] = {"NOT_TRIED", "NOT_TRIED"}; /* 分别保留0x3C和0x3D的探测结果。 */
+static const char *probe_stage[2] = {"IDLE", "IDLE"}; /* 保留每个候选地址的失败阶段，后一次探测不覆盖前一次。 */
+static char lines[OLED_TEXT_ROWS][OLED_TEXT_COLUMNS + 1]; /* 保存八行等宽ASCII文字。 */
+static const char glyph_names[] = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ:=.-/?_"; /* 当前界面使用的字符集合。 */
+static const uint8_t glyphs[][OLED_GLYPH_WIDTH] = /* 每个字节是一列像素，最低位在上，逐行注释说明字符。 */
+{
+    {0x00,0x00,0x00,0x00,0x00}, /* 空格：清空五列。 */
+    {0x3E,0x51,0x49,0x45,0x3E}, /* 数字0。 */
+    {0x00,0x42,0x7F,0x40,0x00}, /* 数字1。 */
+    {0x42,0x61,0x51,0x49,0x46}, /* 数字2。 */
+    {0x21,0x41,0x45,0x4B,0x31}, /* 数字3。 */
+    {0x18,0x14,0x12,0x7F,0x10}, /* 数字4。 */
+    {0x27,0x45,0x45,0x45,0x39}, /* 数字5。 */
+    {0x3C,0x4A,0x49,0x49,0x30}, /* 数字6。 */
+    {0x01,0x71,0x09,0x05,0x03}, /* 数字7。 */
+    {0x36,0x49,0x49,0x49,0x36}, /* 数字8。 */
+    {0x06,0x49,0x49,0x29,0x1E}, /* 数字9。 */
+    {0x7E,0x11,0x11,0x11,0x7E}, /* 字母A。 */
+    {0x7F,0x49,0x49,0x49,0x36}, /* 字母B。 */
+    {0x3E,0x41,0x41,0x41,0x22}, /* 字母C。 */
+    {0x7F,0x41,0x41,0x22,0x1C}, /* 字母D。 */
+    {0x7F,0x49,0x49,0x49,0x41}, /* 字母E。 */
+    {0x7F,0x09,0x09,0x09,0x01}, /* 字母F。 */
+    {0x3E,0x41,0x49,0x49,0x7A}, /* 字母G。 */
+    {0x7F,0x08,0x08,0x08,0x7F}, /* 字母H。 */
+    {0x00,0x41,0x7F,0x41,0x00}, /* 字母I。 */
+    {0x20,0x40,0x41,0x3F,0x01}, /* 字母J。 */
+    {0x7F,0x08,0x14,0x22,0x41}, /* 字母K。 */
+    {0x7F,0x40,0x40,0x40,0x40}, /* 字母L。 */
+    {0x7F,0x02,0x0C,0x02,0x7F}, /* 字母M。 */
+    {0x7F,0x04,0x08,0x10,0x7F}, /* 字母N。 */
+    {0x3E,0x41,0x41,0x41,0x3E}, /* 字母O。 */
+    {0x7F,0x09,0x09,0x09,0x06}, /* 字母P。 */
+    {0x3E,0x41,0x51,0x21,0x5E}, /* 字母Q。 */
+    {0x7F,0x09,0x19,0x29,0x46}, /* 字母R。 */
+    {0x46,0x49,0x49,0x49,0x31}, /* 字母S。 */
+    {0x01,0x01,0x7F,0x01,0x01}, /* 字母T。 */
+    {0x3F,0x40,0x40,0x40,0x3F}, /* 字母U。 */
+    {0x1F,0x20,0x40,0x20,0x1F}, /* 字母V。 */
+    {0x3F,0x40,0x38,0x40,0x3F}, /* 字母W。 */
+    {0x63,0x14,0x08,0x14,0x63}, /* 字母X。 */
+    {0x07,0x08,0x70,0x08,0x07}, /* 字母Y。 */
+    {0x61,0x51,0x49,0x45,0x43}, /* 字母Z。 */
+    {0x00,0x36,0x36,0x00,0x00}, /* 冒号。 */
+    {0x14,0x14,0x14,0x14,0x14}, /* 等号。 */
+    {0x00,0x60,0x60,0x00,0x00}, /* 小数点。 */
+    {0x08,0x08,0x08,0x08,0x08}, /* 减号。 */
+    {0x20,0x10,0x08,0x04,0x02}, /* 斜线。 */
+    {0x02,0x01,0x51,0x09,0x06}, /* 问号，用于未知字符。 */
+    {0x40,0x40,0x40,0x40,0x40} /* 下划线，用于错误名称。 */
+};
+static int SendBytes(uint8_t *data, uint16_t count) /* 统一检查选定总线的传输结果。 */
+{
+#if OLED_USE_SOFTWARE_I2C /* 仿真兼容版使用普通GPIO产生协议时序。 */
+    if (!OledBus_Write(address_7bit, data, count)) /* 只有全部字节得到ACK且STOP成功才算发送成功。 */
+#else /* 保留硬件驱动作为明确可选的对照。 */
+    if (HAL_I2C_Master_Transmit(&hi2c1, (uint16_t)(address_7bit << 1), data, count, OLED_TIMEOUT_MS) != HAL_OK) /* HAL要求把七位地址左移一位。 */
+#endif /* 两条路径共用下面的离线处理。 */
+    {
+        online = 0; /* 通信失败后标记离线，禁止继续假称刷新成功。 */
+        return 0; /* 及时返回主循环，按钮功能仍可运行。 */
+    }
+    return 1; /* 本次传输完整成功。 */
+}
+int Oled_IsOnline(void) /* 对外报告实际通信状态。 */
+{
+    return online; /* 返回最近一次传输结果。 */
+}
+uint8_t Oled_Address(void) /* 返回七位地址供串口诊断。 */
+{
+    return online ? address_7bit : 0; /* 离线时不报告一个未确认的有效地址。 */
+}
+const char *Oled_ProbeError(uint8_t candidate) /* 查询指定七位地址最近一次探测的错误。 */
+{
+    if (candidate != 0x3C && candidate != 0x3D) /* 本驱动仅支持SSD1306的两个候选地址。 */
+    {
+        return "INVALID_ADDRESS"; /* 拒绝把无关地址映射到已有结果。 */
+    }
+    return probe_error[candidate == 0x3D]; /* 0x3C取第一项，0x3D取第二项。 */
+}
+const char *Oled_ProbeStage(uint8_t candidate) /* 查询指定七位地址的失败位置。 */
+{
+    if (candidate != 0x3C && candidate != 0x3D) /* 与错误查询使用相同的地址校验。 */
+    {
+        return "INVALID_ADDRESS"; /* 防止报告与地址不对应的阶段。 */
+    }
+    return probe_stage[candidate == 0x3D]; /* 返回与该候选地址绑定的阶段。 */
+}
+void Oled_SetLine(int row, const char *text) /* 完整覆盖一行，避免短文字后遗留旧字符。 */
+{
+    int column = 0; /* 从行首开始复制。 */
+    if (row < 0 || row >= OLED_TEXT_ROWS || text == NULL) /* 拒绝越界行号与空指针。 */
+    {
+        return; /* 不访问屏幕缓冲以外的内存。 */
+    }
+    memset(lines[row], ' ', OLED_TEXT_COLUMNS); /* 先把整行填为空格。 */
+    while (text[column] != '\0' && column < OLED_TEXT_COLUMNS) /* 最多复制屏幕能容纳的21个字符。 */
+    {
+        lines[row][column] = text[column]; /* 保存当前字符。 */
+        ++column; /* 移动到下一字符。 */
+    }
+    lines[row][OLED_TEXT_COLUMNS] = '\0'; /* 保留合法的字符串终止符。 */
+}
+void Oled_SetProgressCallback(void (*callback)(int completed_pages)) /* 允许主程序报告实际发送进度。 */
+{
+    progress_callback = callback; /* 只保存函数地址，注册时不执行任何通信。 */
+}
+int Oled_Flush(void) /* 逐页定位并刷新全部像素。 */
+{
+    int row, column, pixel, offset; /* 分别遍历页、字符、字形列和本页分包偏移。 */
+    uint8_t packet[OLED_WIDTH + 1]; /* 第一字节为数据控制字，随后是128个像素列。 */
+    uint8_t chunk[OLED_DATA_CHUNK_BYTES + 1]; /* 每笔独立交易带一个控制字和至多16个像素字节。 */
+    uint8_t command[4] = {OLED_CONTROL_COMMAND, OLED_PAGE_BASE, OLED_COLUMN_LOW, OLED_COLUMN_HIGH}; /* 准备页面定位命令。 */
+    if (!online) /* 离线时不对每页重复超时。 */
+    {
+        return 0; /* 让上层负责低频重连。 */
+    }
+    for (row = 0; row < OLED_TEXT_ROWS; ++row) /* 按顺序处理八页。 */
+    {
+        command[1] = (uint8_t)(OLED_PAGE_BASE + row); /* 选择当前页。 */
+        if (!SendBytes(command, sizeof(command))) /* 先设置页地址和列零点。 */
+        {
+            return 0; /* 定位失败立即结束刷新。 */
+        }
+        memset(packet, 0, sizeof(packet)); /* 清空全部像素，包括每行末尾的两列。 */
+        packet[0] = OLED_CONTROL_DATA; /* 后续128字节为显示数据。 */
+        for (column = 0; column < OLED_TEXT_COLUMNS; ++column) /* 转换本页的21个字符。 */
+        {
+            const char *found = strchr(glyph_names, lines[row][column]); /* 查找字符对应的字形索引。 */
+            int glyph = found != NULL && *found != '\0' ? (int)(found - glyph_names) : (int)(strchr(glyph_names, '?') - glyph_names); /* 未支持的字符显示问号。 */
+            for (pixel = 0; pixel < OLED_GLYPH_WIDTH; ++pixel) /* 写入字形的五列像素。 */
+            {
+                packet[1 + column * OLED_CHARACTER_WIDTH + pixel] = glyphs[glyph][pixel]; /* 每字符之后保留一列黑色间隔。 */
+            }
+        }
+
+#if OLED_DIAGNOSTIC_MODE == 2
+        /* 测试GDDRAM写入路径，绕开ASCII字库和文字缓冲的影响。 */
+        memset(&packet[1], 0xFF, OLED_WIDTH);
+#endif
+        for (offset = 0; offset < OLED_WIDTH; offset += OLED_DATA_CHUNK_BYTES) /* 每页拆成八笔交易，列指针由SSD1306逐字节递增。 */
+        {
+            int remaining = OLED_WIDTH - offset; /* 计算当前页还未发送的像素字节数。 */
+            int count = remaining < OLED_DATA_CHUNK_BYTES ? remaining : OLED_DATA_CHUNK_BYTES; /* 最后一包只发送剩余数据，避免越界。 */
+            chunk[0] = OLED_CONTROL_DATA; /* 每个START之后都必须重新发送0x40数据控制字。 */
+            memcpy(&chunk[1], &packet[1 + offset], (size_t)count); /* 复制本包对应的连续像素列，不覆盖前面已发送的列。 */
+            if (!SendBytes(chunk, (uint16_t)(count + 1))) /* 每包独立START、地址、控制字、数据、ACK和STOP。 */
+            {
+                return 0; /* 任一分包失败就离线退出，禁止遗漏像素后报告成功。 */
+            }
+        }
+        if (progress_callback != NULL) /* 页内八包全部成功后才报告进度。 */
+        {
+            progress_callback(row + 1); /* 当前交易已经STOP；回调只能报告进度，不可再次调用OLED接口。 */
+        }
+    }
+    return 1; /* 八页均传输成功。 */
+}
+int Oled_Init(void) /* 自动识别模块常见七位地址并执行完整初始化。 */
+{
+    const uint8_t candidates[] = {0x3C, 0x3D}; /* SSD1306的地址选择位决定这两个七位地址。 */
+    uint8_t direct_probe[] = {OLED_CONTROL_COMMAND, OLED_DISPLAY_OFF}; /* 当仿真模型不响应空地址探测时，用合法的关屏命令再次试探。 */
+    uint8_t setup[] = {OLED_CONTROL_COMMAND, OLED_DISPLAY_OFF, OLED_CLOCK, OLED_CLOCK_DEFAULT, OLED_MULTIPLEX, OLED_LAST_ROW, OLED_OFFSET, OLED_ZERO_OFFSET, OLED_START_LINE, OLED_CHARGE_PUMP, OLED_PUMP_ENABLE, OLED_ADDRESS_MODE, OLED_PAGE_MODE, OLED_SEGMENT_REMAP, OLED_COM_REVERSE, OLED_COM_PINS, OLED_COM_64_ROWS, OLED_CONTRAST, OLED_CONTRAST_NORMAL, OLED_PRECHARGE, OLED_PRECHARGE_INTERNAL, OLED_VCOM, OLED_VCOM_NORMAL, OLED_USE_RAM, OLED_NORMAL_PIXELS, OLED_SCROLL_OFF}; /* 用已命名命令配置128乘64屏幕。 */
+    uint8_t on[] = {OLED_CONTROL_COMMAND, OLED_DISPLAY_ON}; /* 最后开启已清空的画面。 */
+    int index; /* 遍历两个候选地址和八行文字。 */
+    online = 0; /* 每次重新探测前清除旧在线状态。 */
+    address_7bit = 0; /* 清除上次连接的地址。 */
+    for (index = 0; index < (int)sizeof(candidates); ++index) /* 清除上一轮两个地址的结果，包括本轮可能跳过的地址。 */
+    {
+        probe_error[index] = "NOT_TRIED"; /* 明确区分未尝试和确实无应答。 */
+        probe_stage[index] = "IDLE"; /* 未尝试的地址没有失败阶段。 */
+    }
+    for (index = 0; index < (int)sizeof(candidates); ++index) /* 只探测SSD1306的两个地址，不扫描整条总线。 */
+    {
+#if OLED_USE_SOFTWARE_I2C /* GPIO方案直接用有效SSD1306命令探测，检查地址及数据ACK。 */
+        int acknowledged = OledBus_Write(candidates[index], direct_probe, sizeof(direct_probe)); /* 七位地址由总线层统一转换。 */
+        probe_error[index] = OledBus_Error(); /* 在下一次交易覆盖总线状态前保存该地址的错误。 */
+        probe_stage[index] = OledBus_Stage(); /* 同时保存ADDRESS、CONTROL或PAYLOAD等阶段。 */
+#else /* 硬件对照方案保留原来的两种探测过程。 */
+        int acknowledged = HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(candidates[index] << 1), 1, OLED_PROBE_TIMEOUT_MS) == HAL_OK; /* 先尝试标准的限时地址探测。 */
+        if (!acknowledged) /* 某些仿真模型可能不响应只含地址的探测过程。 */
+        {
+            acknowledged = HAL_I2C_Master_Transmit(&hi2c1, (uint16_t)(candidates[index] << 1), direct_probe, sizeof(direct_probe), OLED_TIMEOUT_MS) == HAL_OK; /* 再发送有效SSD1306命令，成功才承认屏幕在线。 */
+        }
+#endif /* 两种驱动都必须确认应答才能把屏幕标为在线。 */
+        if (acknowledged) /* 两种探测方式只要有一次真正收到应答即可初始化。 */
+        {
+            address_7bit = candidates[index]; /* 保存真正应答的七位地址。 */
+            online = 1; /* 允许接下来的初始化传输。 */
+            break; /* 找到一个屏幕后结束探测。 */
+        }
+    }
+    if (!online || !SendBytes(setup, sizeof(setup))) /* 未找到模块或配置失败时立即返回。 */
+    {
+        return 0; /* 由上层通过串口提示离线。 */
+    }
+    for (index = 0; index < OLED_TEXT_ROWS; ++index) /* 清空所有文本行。 */
+    {
+        Oled_SetLine(index, ""); /* 生成全空格的一行。 */
+    }
+    if (!Oled_Flush() || !SendBytes(on, sizeof(on))) /* 先清屏，再发送0xAF开启显示。 */
+    {
+        return 0; /* 任一步失败时保留已有错误报告。 */
+    }
+#if OLED_DIAGNOSTIC_MODE == 1
+    {
+        uint8_t force_on[] = {OLED_CONTROL_COMMAND, 0xA5}; /* A5强制全亮，完全绕过显示RAM和字模。 */
+        return SendBytes(force_on, sizeof(force_on)); /* 只有真实收到ACK才算诊断命令发出成功。 */
+    }
+#else
+    return 1; /* 模式0正常刷新文字；模式2改用GDDRAM全亮诊断。 */
+#endif
+}
