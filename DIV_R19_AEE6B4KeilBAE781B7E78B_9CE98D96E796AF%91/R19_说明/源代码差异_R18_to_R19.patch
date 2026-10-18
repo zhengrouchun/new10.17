@@ -1,0 +1,275 @@
+--- R18/Inc/div_app_types.h
++++ R19/Inc/div_app_types.h
+@@ -10,7 +10,9 @@
+     uint32_t va_mv; /* VA 四舍五入后的 mV 值。 */
+     uint32_t adc_conversions; /* 每次 Poll 成功并 GetValue 后递增。 */
+     uint32_t feature_reads; /* 实际获得有效读数的不同节点数。 */
+-    uint32_t elapsed_ms; /* 截图模式只统计两点采样和判别耗时，不含串口发送及报告间隔。 */
++    uint32_t elapsed_ms; /* 包含电源稳定、采样、观察窗口及最终切换的累计时间。 */
++    uint32_t cycle_id; /* 本次RETEST/上电测量流水号，串口及OLED使用同一编号。 */
++    uint32_t sample_tick_ms; /* 读取VA/VB之后的毫秒时间戳，供与Proteus同一时刻的电压表比较。 */
+     int vb_valid; /* VB 已有效采样时为真，未读时输出 NA。 */
+     int va_valid; /* VA 已有效采样时为真，未读时输出 NA。 */
+     int state; /* 唯一工况编号，或 DIV_UNKNOWN。 */
+--- R18/Inc/div_display.h
++++ R19/Inc/div_display.h
+@@ -3,6 +3,7 @@
+ #define DIV_DISPLAY_H
+ #include "div_app_types.h"
+ void DivDisplay_Initialize(void); /* 初始化项目已有OLED驱动。 */
++void DivDisplay_BeginMeasurement(uint32_t cycle_id); /* 新一轮开始立即抹除旧工况；OLED改显示TESTING。 */
+ void DivDisplay_SetMeasurement(const DivMeasurement *measurement); /* 缓存一轮测量结果并请求刷新。 */
+ void DivDisplay_RequestRefresh(void); /* 请求主循环刷新显示。 */
+ void DivDisplay_Service(void); /* 刷新发生变化的OLED画面。 */
+--- R18/Src/div_display.c
++++ R19/Src/div_display.c
+@@ -14,6 +14,7 @@
+ typedef struct
+ {
+     int state;
++    uint32_t cycle_id;
+     uint32_t vb_mv;
+     uint32_t va_mv;
+     uint8_t vb_valid;
+@@ -24,6 +25,8 @@
+ static volatile int display_dirty = 1;
+ static DisplaySnapshot snapshot = {DIV_UNKNOWN, 0, 0, 0, 0, 0};
+ static int has_measurement = 0;
++static int measurement_in_progress = 0;
++static uint32_t active_cycle_id = 0;
+ static int oled_reported_init_state = -1;
+ #if OLED_DISPLAY_ENABLE
+ static uint32_t last_status_ms = 0;
+@@ -34,6 +37,15 @@
+     display_dirty = 1;
+ }
+ 
++void DivDisplay_BeginMeasurement(uint32_t cycle_id)
++{
++    /* 一轮检测开始，旧工况不能再在OLED上伪装成本轮结果。 */
++    active_cycle_id = cycle_id;
++    measurement_in_progress = 1;
++    has_measurement = 0;
++    display_dirty = 1;
++}
++
+ void DivDisplay_SetMeasurement(const DivMeasurement *measurement)
+ {
+     if (measurement == NULL)
+@@ -41,6 +53,14 @@
+         return;
+     }
+ 
++    /* 一次检测只接受对应轮次的记录，避免未来异步路径覆盖新数据。 */
++    if (measurement->cycle_id < active_cycle_id)
++    {
++        return;
++    }
++    active_cycle_id = measurement->cycle_id;
++    snapshot.cycle_id = measurement->cycle_id;
++    measurement_in_progress = 0;
+     /* 逐字段复制，不再整体 memcpy 一个含指针成员的结构体。 */
+     snapshot.state = measurement->state;
+     snapshot.vb_mv = measurement->vb_mv;
+@@ -95,12 +115,13 @@
+     }
+ 
+     written = snprintf(line, sizeof(line),
+-        "HB=%lu STATE=%s RUN=%s TEST=%s OLED=%s FW=DIV_REQ_R18\r\n",
++        "HB=%lu STATE=%s RUN=%s TEST=%s OLED=%s CYCLE=%lu FW=DIV_SYNC_R19\r\n",
+         (unsigned long)now_ms,
+         measured_state,
+         HAL_GPIO_ReadPin(GPIOB, RUN_POWER_PIN) == GPIO_PIN_SET ? "HIGH" : "LOW",
+         HAL_GPIO_ReadPin(GPIOB, TEST_POWER_PIN) == GPIO_PIN_SET ? "HIGH" : "LOW",
+-        Oled_IsInitialized() ? "DONE" : "PENDING");
++        Oled_IsInitialized() ? "DONE" : "PENDING",
++        (unsigned long)active_cycle_id);
+ 
+     if (written <= 0 || written >= (int)sizeof(line))
+     {
+@@ -141,6 +162,10 @@
+         {
+             Oled_SetLine(0, "DIV STOPPED");
+         }
++        else if (measurement_in_progress)
++        {
++            Oled_SetLine(0, "DIV TESTING");
++        }
+         else if (!has_measurement)
+         {
+             Oled_SetLine(0, "DIV READY");
+@@ -159,27 +184,40 @@
+             Oled_SetLine(0, line);
+         }
+ 
+-        if (has_measurement && snapshot.vb_valid)
+-        {
+-            snprintf(line, sizeof(line), "VB:%lu mV", (unsigned long)snapshot.vb_mv);
+-            Oled_SetLine(1, line);
++        /* STOP状态下旧电压不是当前节点读数，故OLED不再显示为实时值。 */
++        if (DivPower_StopIsActive())
++        {
++            Oled_SetLine(1, "VB:NA STOPPED");
++            Oled_SetLine(2, "VA:NA STOPPED");
++        }
++        else if (measurement_in_progress)
++        {
++            Oled_SetLine(1, "VB:MEASURING");
++            Oled_SetLine(2, "VA:MEASURING");
+         }
+         else
+         {
+-            Oled_SetLine(1, "VB:NA");
+-        }
+-
+-        if (has_measurement && snapshot.va_valid)
+-        {
+-            snprintf(line, sizeof(line), "VA:%lu mV", (unsigned long)snapshot.va_mv);
+-            Oled_SetLine(2, line);
+-        }
+-        else
+-        {
+-            Oled_SetLine(2, "VA:NA");
+-        }
+-
+-        /* 第四行必须反映检测结束后的最终供电。文件要求：DIV0=T:OFF/R:ON；故障=T:OFF/R:OFF。 */
++            if (has_measurement && snapshot.vb_valid)
++            {
++                snprintf(line, sizeof(line), "VB:%lu mV", (unsigned long)snapshot.vb_mv);
++                Oled_SetLine(1, line);
++            }
++            else
++            {
++                Oled_SetLine(1, "VB:NA");
++            }
++
++            if (has_measurement && snapshot.va_valid)
++            {
++                snprintf(line, sizeof(line), "VA:%lu mV", (unsigned long)snapshot.va_mv);
++                Oled_SetLine(2, line);
++            }
++            else
++            {
++                Oled_SetLine(2, "VA:NA");
++            }
++        }
++        /* T/R只表示GPIO命令状态；是否真的1V/3V需观察负载节点。 */
+         snprintf(line, sizeof(line), "T:%s R:%s",
+             HAL_GPIO_ReadPin(GPIOB, TEST_POWER_PIN) == GPIO_PIN_SET ? "ON" : "OFF",
+             HAL_GPIO_ReadPin(GPIOB, RUN_POWER_PIN) == GPIO_PIN_SET ? "ON" : "OFF");
+@@ -191,7 +229,7 @@
+     {
+         oled_reported_init_state = Oled_IsInitialized();
+         written = snprintf(message, sizeof(message),
+-            "OLED_INIT=%s ADDRESS_CONFIGURED_7BIT=0x%02X ACK=UNCHECKED FW=DIV_REQ_R18\r\n",
++            "OLED_INIT=%s ADDRESS_CONFIGURED_7BIT=0x%02X ACK=UNCHECKED FW=DIV_SYNC_R19\r\n",
+             oled_reported_init_state ? "DONE" : "PENDING",
+             (unsigned int)Oled_Address());
+         if (written > 0 && written < (int)sizeof(message))
+--- R18/Src/div_measurement.c
++++ R19/Src/div_measurement.c
+@@ -18,6 +18,8 @@
+  *   PA1 / ADC_CHANNEL_1 = DIV_VA
+  * 这样每轮 RETEST 都从确定的通道开始，避免不同轮次出现顺序/状态残留。
+  */
++static uint32_t next_cycle_id = 0; /* 上电初始检测为ID=1，后续RETEST逐次递增。 */
++
+ static const char *ReadAdcChannel(uint32_t channel, uint32_t *raw, uint32_t *conversions)
+ {
+     ADC_ChannelConfTypeDef sConfig = {0};
+@@ -111,8 +113,10 @@
+     }
+ 
+     written = snprintf(line, sizeof(line),
+-        "TEST_SAMPLE STATE=%s CASE=%s VB_RAW=%lu VB_MV=%lu VA_RAW=%lu VA_MV=%lu "
+-        "TEST_GPIO=%s RUN_GPIO=%s ADC_MODE=EXPLICIT_CH0_VB_CH1_VA HOLD_MS=%lu ERROR=%s FW=DIV_REQ_R18\r\n",
++        "TEST_SAMPLE ID=%lu SAMPLE_T=%lu STATE=%s CASE=%s VB_RAW=%lu VB_MV=%lu VA_RAW=%lu VA_MV=%lu "
++        "TEST_GPIO=%s RUN_GPIO=%s ADC_MODE=EXPLICIT_CH0_VB_CH1_VA HOLD_MS=%lu ERROR=%s FW=DIV_SYNC_R19\r\n",
++        (unsigned long)result->cycle_id,
++        (unsigned long)result->sample_tick_ms,
+         state_text,
+         case_name,
+         (unsigned long)result->vb_raw,
+@@ -164,10 +168,11 @@
+     }
+ 
+     written = snprintf(line, sizeof(line),
+-        "STATE=%s KIND=%s CASE=%s VB_RAW=%s VB_MV=%s VA_RAW=%s VA_MV=%s "
++        "STATE=%s ID=%lu SAMPLE_T=%lu KIND=%s CASE=%s VB_RAW=%s VB_MV=%s VA_RAW=%s VA_MV=%s "
+         "FEATURE_READS=%lu ADC_CONVERSIONS=%lu ELAPSED_MS=%lu "
+-        "RUN_POWER=%s TEST_POWER=%s POWER_SOURCE=GPIO_LEVEL ERROR=%s FW=DIV_REQ_R18\r\n",
+-        state_text, kind, case_name,
++        "RUN_POWER=%s TEST_POWER=%s POWER_SOURCE=GPIO_LEVEL ERROR=%s FW=DIV_SYNC_R19\r\n",
++        state_text, (unsigned long)result->cycle_id,
++        (unsigned long)result->sample_tick_ms, kind, case_name,
+         vb_raw_text, vb_mv_text, va_raw_text, va_mv_text,
+         (unsigned long)result->feature_reads,
+         (unsigned long)result->adc_conversions,
+@@ -191,8 +196,11 @@
+     DivMeasurement result = {0};
+     uint32_t started_ms = HAL_GetTick();
+ 
++    result.cycle_id = ++next_cycle_id;
+     result.state = DIV_UNKNOWN;
+     result.error = "STOP_REQUESTED";
++    /* 必须先通知显示本轮已开始，清除OLED上上一轮工况的假象。 */
++    DivDisplay_BeginMeasurement(result.cycle_id);
+ 
+     /* 先断3V并打开1V测试。 */
+     if (!DivPower_Select(TEST_POWER_PIN) ||
+@@ -205,6 +213,8 @@
+         return;
+     }
+ 
++    /* TEST阶段电源已稳定，再显示TESTING并开始本次采样。 */
++    DivDisplay_Service();
+     /* 当前正处于1V测试阶段，读取PA0(VB)和PA1(VA)。 */
+     result.error = ReadAdcPair(&result.vb_raw, &result.va_raw, &result.adc_conversions);
+     if (strcmp(result.error, "OK") == 0)
+@@ -214,6 +224,7 @@
+         result.vb_mv = DivCodeToMillivolts(result.vb_raw);
+         result.va_mv = DivCodeToMillivolts(result.va_raw);
+         result.feature_reads = 2;
++        result.sample_tick_ms = HAL_GetTick();
+         result.state = DivClassify((int32_t)result.vb_mv, (int32_t)result.va_mv);
+ 
+         /* 这条日志发生在TEST仍为HIGH时，用来和Proteus电压表同一阶段比对。 */
+--- R18/Src/main.c
++++ R19/Src/main.c
+@@ -99,7 +99,7 @@
+ DivPower_Initialize(); /* GPIO初始化后确保两路电源均关闭。 */
+ HAL_Delay(TERMINAL_STARTUP_WAIT_MILLISECONDS); /* 等待虚拟终端进入接收状态。 */
+ {
+-    const char startup[] = "FW=DIV_REQ_R18 OLED_MODE=TEXT4X16 ACK=UNCHECKED MODE=ON_DEMAND VREF_MV=3300 ADC_BITS=12 BAUD=57600\r\n"; /* 标记固件版本并保留原启动字段。 */
++    const char startup[] = "FW=DIV_SYNC_R19 OLED_MODE=TEXT4X16 ACK=UNCHECKED MODE=ON_DEMAND VREF_MV=3300 ADC_BITS=12 BAUD=57600\r\n"; /* 标记固件版本并保留原启动字段。 */
+     if (HAL_UART_Transmit(&huart1, (uint8_t *)startup, sizeof(startup) - 1, UART_TIMEOUT_MILLISECONDS) != HAL_OK) /* 发送启动状态。 */
+     {
+         Error_Handler(); /* 串口启动失败时进入断电停机。 */
+@@ -112,11 +112,11 @@
+     Error_Handler(); /* 校准失败时禁止继续检测。 */
+ }
+ DivControl_InitializeButtons(); /* 初始化RETEST外部中断事件状态。 */
+-DivControl_Trace("INITIAL_DETECTION_START"); /* 启动后先测当前电路，避免OLED先显示旧默认DIV0。 */
+-DivMeasurement_Run(); /* 首轮检测结果先缓存并通过串口输出。 */
+-DivControl_Trace("OLED_INIT_BEGIN"); /* 记录OLED初始化前的控制状态。 */
+-DivDisplay_Initialize(); /* OLED初始化完成后会强制显示刚缓存的首轮结果。 */
+-DivControl_Trace("OLED_INIT_END"); /* 记录OLED初始化函数已返回。 */
++DivControl_Trace("OLED_INIT_BEGIN");
++DivDisplay_Initialize(); /* 先显示，再开始耗时采样，避免开机等待6秒后才点亮。 */
++DivControl_Trace("OLED_INIT_END");
++DivControl_Trace("INITIAL_DETECTION_START");
++DivMeasurement_Run(); /* 首轮检测在OLED已初始化后运行，可实时显示TESTING和采样结果。 */
+   /* USER CODE END 2 */
+ 
+   /* Infinite loop */
+--- R18/Src/div_control.c
++++ R19/Src/div_control.c
+@@ -107,7 +107,7 @@
+     static char line[BUTTON_TRACE_BUFFER_SIZE];
+     uint32_t input_snapshot = GPIOA->IDR;
+     int written = snprintf(line, sizeof(line),
+-        "EV=%s T=%lu PA4=%s PA5=%s PEND=%s STOP=%s IDR=0x%04lX RAW_IRQ=%lu ACCEPT=%lu FW=DIV_REQ_R16\r\n",
++        "EV=%s T=%lu PA4=%s PA5=%s PEND=%s STOP=%s IDR=0x%04lX RAW_IRQ=%lu ACCEPT=%lu FW=DIV_SYNC_R19\r\n",
+         event, (unsigned long)HAL_GetTick(),
+         (input_snapshot & RETEST_BUTTON_PIN) ? "HIGH" : "LOW",
+         (input_snapshot & STOP_BUTTON_PIN) ? "HIGH" : "LOW",

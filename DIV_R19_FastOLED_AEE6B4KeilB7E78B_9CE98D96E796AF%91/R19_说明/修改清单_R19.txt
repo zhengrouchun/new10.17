@@ -1,0 +1,11 @@
+R19替换文件：
+  代码/Inc/div_app_types.h
+  代码/Inc/div_display.h
+  代码/Src/div_display.c
+  代码/Src/div_measurement.c
+  代码/Src/main.c
+  代码/Src/div_control.c
+其余源码/所有DIV分类阈值保持R18原样。
+版本：DIV_SYNC_R19；串口57600。
+注意：不能在缺少Proteus网表的情况下修正物理并联、断路/短路故障设置。
+新HEX尚未生成，必须Keil Rebuild再在Proteus重选。

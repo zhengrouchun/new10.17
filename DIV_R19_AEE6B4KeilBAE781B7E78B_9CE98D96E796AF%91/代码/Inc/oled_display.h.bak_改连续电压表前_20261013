@@ -1,0 +1,14 @@
+#ifndef OLED_DISPLAY_H /* 防止显示接口被重复声明。 */
+#define OLED_DISPLAY_H /* 标记显示接口已经加载。 */
+#include <stdint.h> /* 使用明确位宽的页号和地址类型。 */
+#define OLED_TEXT_ROWS 8 /* 64个像素高划分成8行，每行8像素。 */
+#define OLED_TEXT_COLUMNS 21 /* 每字符宽6像素，128像素可显示21个字符。 */
+int Oled_Init(void); /* 探测0x3C或0x3D并初始化SSD1306，失败返回假。 */
+int Oled_IsOnline(void); /* 查询最近一次通信是否成功。 */
+uint8_t Oled_Address(void); /* 返回当前七位I2C地址，未连接时返回零。 */
+const char *Oled_ProbeError(uint8_t candidate); /* 分别查询0x3C或0x3D最近一次探测的错误。 */
+const char *Oled_ProbeStage(uint8_t candidate); /* 查询同一候选地址的失败阶段，避免日志只剩最后一次结果。 */
+void Oled_SetLine(int row, const char *text); /* 更新一行文本并自动清除旧行尾。 */
+int Oled_Flush(void); /* 将八行缓冲发送到屏幕，通信失败退出而不无限等待。 */
+void Oled_SetProgressCallback(void (*callback)(int completed_pages)); /* 注册每完成一页的通知，慢速仿真时可显示实际进度。 */
+#endif /* 结束头文件重复包含保护。 */

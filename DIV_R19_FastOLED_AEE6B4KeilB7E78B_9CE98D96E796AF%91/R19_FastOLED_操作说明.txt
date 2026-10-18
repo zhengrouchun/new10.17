@@ -1,0 +1,32 @@
+﻿R19 FastOLED 显示精简补丁（2026-10-18）
+====================================
+基础版本：DIV_R19_完整Keil源码工程_需重新编译.zip
+固件识别标志：FW=DIV_SYNC_R19_FASTOLED
+
+修改范围（只变更显示刷新和固件版本号）：
+1. 代码/Src/div_measurement.c
+   - 删除进入ADC采样前执行的 DivDisplay_Service()；不再主动显示 TESTING。
+   - 在TEST_SAMPLE后仍更新OLED一次，保留1V测量观察窗口和原业务流程。
+2. 代码/Src/div_display.c + 代码/Inc/div_display.h
+   - 每轮启动不触发预采样刷屏；取消DIV TESTING与VB/VA:MEASURING显示分支。
+   - STOP、DIV工况、真实VA/VB以及T/R保持原逻辑。
+3. 代码/Src/oled_display.c + 代码/Inc/oled_display.h
+   - Oled_Flush()对比四行缓存，只写改动过的行；首次刷新仍写全屏。
+   - 保留原OLED_ShowString函数和I2C驱动。
+4. 代码/Src/main.c、div_control.c、div_display.c、div_measurement.c
+   - 日志版本字段更新为DIV_SYNC_R19_FASTOLED，方便核对是否加载了新HEX。
+
+安装方式：
+A. 先完整备份已有的Keil项目和Proteus工程。
+B. 将本ZIP中代码/Src下5个*.c替换工程对应的Core/Src或代码/Src中同名文件，
+   代码/Inc下2个*.h替换对应同名头文件。
+C. 用原项目的Keil重新Rebuild，并核对编译无Error后生成HEX。
+D. 在Proteus双击STM32，重新指定编译后新HEX，虚拟串口设为57600/8N1。
+E. 查看启动日志是否为FW=DIV_SYNC_R19_FASTOLED；若不是则加载的是旧固件。
+
+重要限制：
+- 本补丁不修改电阻电路、开关状态、ADC通道、分类阈值、PB12/PB13控制和STOP/RETEST。
+- 本补丁不能修复电路测量与ADC不一致，更不能保证DIV0/DIV1/DIV6通过。
+- 仍需要先单独测固定1V、RS=2k/R1=10k/R2=10k最小电路，再按任务单验证PA0=VB/PA1=VA。
+- OLED为一次采样的快照，不是持续刷新的电压表。TEST_SAMPLE同轮、同阶段比较。
+- 暂未在Keil和Proteus环境编译/仿真验证，使用前必须Rebuild并跑三工况测试。

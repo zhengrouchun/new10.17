@@ -2,13 +2,13 @@
 <WORKSPACE>
  <FRAME activeWindow="0">
   <PLACEMENT>01d9d0cb000300000000008b000001d300000959000008010000008d0000020d00000957000007ff00000000000000000c800000008d0000020d00000957000007ff</PLACEMENT>
-  <WINDOW module="STARTUP" index="0" type="default"/>
+  <WINDOW type="default" index="0" module="STARTUP"/>
  </FRAME>
  <MODULE name="ISIS">
-  <editor gridmajor="0" zoom="10" snap="0" flipped="0" snapidx="2" snaprange="0" gridminor="0" metric="0" scale="10" orgmode="0" gridmode="2" xcursor="0">
-   <centre x="0" y="0"/>
-   <origin x="0" y="0"/>
-   <world x1="-1" y2="1" y1="-1" x2="1"/>
+  <editor scale="10" gridmajor="0" gridmode="2" flipped="0" zoom="10" xcursor="0" snaprange="0" snap="0" orgmode="0" snapidx="2" metric="0" gridminor="0">
+   <centre y="0" x="0"/>
+   <origin y="0" x="0"/>
+   <world x1="-1" x2="1" y2="1" y1="-1"/>
   </editor>
  </MODULE>
 </WORKSPACE>
